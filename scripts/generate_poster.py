@@ -9,18 +9,34 @@ import sys
 import json
 import urllib.request
 import urllib.parse
-from google import genai
-import requests
+from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
+from google import genai
+from google.genai.types import HttpOptions, GenerateContentConfig
 
 # ---------------------------------------------------------
 # 配置区
 # ---------------------------------------------------------
-# Google Gemini API Config
-GOOGLE_API_KEY = "AIzaSyByPHoEpVjgzo4vl-S5_qz5Mo8q3OwnFUA"
+# Zenmux / Vertex AI 统一中转配置
+ZENMUX_API_KEY = "sk-ai-v1-70d6bc6a5281bff6802214468c45a6325a9a3a93c4f33c34063e9bfc59a170dd"
+ZENMUX_ENDPOINT = "https://zenmux.ai/api/vertex-ai"
 
-# Initialize GenAI Client
-client = genai.Client(api_key=GOOGLE_API_KEY)
+# Initialize Google GenAI client to point to Zenmux Vertex AI
+client = genai.Client(
+    api_key=ZENMUX_API_KEY,
+    vertexai=True,
+    http_options=HttpOptions(
+        base_url=ZENMUX_ENDPOINT,
+        api_version="v1"
+    )
+)
+
+# 阶段 A：大语言模型提取画图 Prompt 
+LLM_MODEL = "gemini-2.5-flash"
+
+# 阶段 B：使用 Gemini 3 Pro Image Preview 生图
+# NOTE: Zenmux 平台不支持独立的 Imagen 3 模型，但支持 Gemini 多模态生图
+IMAGE_MODEL = "gemini-3-pro-image-preview"
 
 # 基础路径配置
 BASE_DIR = os.path.join(os.path.dirname(__file__), "..")
@@ -48,8 +64,8 @@ FINAL_IMAGE_PATH = os.path.join(OUTPUTS_DIR, "final_poster_with_text.png")
 # ---------------------------------------------------------
 
 def stage_a_generate_prompt(event_data):
-    """阶段 A: 调用 Gemini大模型 根据活动信息写出生图提示词"""
-    print("🧠 [阶段 A] 正在调用 Google Gemini 构思海报画面...")
+    """阶段 A: 调用 Zenmux 代理大模型 根据活动信息写出生图提示词"""
+    print("🧠 [阶段 A] 正在通过 Zenmux 调用大模型构思海报画面...")
     
     title = event_data.get("title", "精彩活动")
     highlights = ", ".join(event_data.get("highlights", []))
@@ -67,49 +83,57 @@ def stage_a_generate_prompt(event_data):
 
     try:
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model=LLM_MODEL,
             contents=f"{system_prompt}\n\n{user_content}"
         )
         generated_prompt = response.text.strip()
         print(f"✨ 构思完毕 Prompt: \n{generated_prompt}")
         return generated_prompt
     except Exception as e:
-        print(f"⚠️ Gemini 大模型调用失败 ({e})，使用备用基础 Prompt。")
+        print(f"⚠️ Zenmux 大模型调用失败 ({e})，使用备用基础 Prompt。")
         return "Clean minimalist flat illustration vector art background, lots of negative space for text, vibrant colors, no text, no letters. Masterpiece."
 
 
 def stage_b_generate_base_image(prompt):
-    """阶段 B: 调用 Google Imagen 3 生成底图并保存"""
-    print("🎨 [阶段 B] 正在呼叫 Google Imagen 3 绘制底图...")
+    """阶段 B: 调用 Zenmux (Gemini 3 Pro Image Preview) 生成底图并保存"""
+    print("🎨 [阶段 B] 正在通过 Zenmux 呼叫 Gemini 3 Pro 多模态生图引擎...")
     
     try:
-        result = client.models.generate_images(
-            model='imagen-3.0-generate-001',
-            prompt=prompt,
-            config=dict(
-                number_of_images=1,
-                aspect_ratio="3:4", 
-                output_mime_type="image/jpeg",
-                person_generation="DONT_ALLOW"
+        # Gemini 3 Pro Image Preview 通过多模态方式生成图片
+        # 必须指定 response_modalities 包含 IMAGE
+        response = client.models.generate_content(
+            model=IMAGE_MODEL,
+            contents=f"Generate an image: {prompt}",
+            config=GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"]
             )
         )
         
-        if result.generated_images:
-            image_data = result.generated_images[0].image.image_bytes
-            img = Image.open(BytesIO(image_data))
-            # Resize image to our poster target 1024x1448
-            img = img.resize((1024, 1448), Image.Resampling.LANCZOS)
-            img.save(BASE_IMAGE_PATH)
-            
-            print(f"🖼️ 底图绘制成功并下载至: {BASE_IMAGE_PATH}")
-            return True
-        else:
-            print("❌ 未收到生成的图像数据。")
-            return False
+        # 从返回结果中提取图片数据
+        for part in response.candidates[0].content.parts:
+            if part.inline_data:
+                print(f"📦 收到图片数据: {part.inline_data.mime_type}, {len(part.inline_data.data)} bytes")
+                img = Image.open(BytesIO(part.inline_data.data))
+                # Resize image to our poster target 1024x1448
+                img = img.resize((1024, 1448), Image.Resampling.LANCZOS)
+                img.save(BASE_IMAGE_PATH)
+                print(f"🖼️ 底图绘制成功并保存至: {BASE_IMAGE_PATH}")
+                return True
+        
+        raise Exception("返回结果中未包含图片数据")
             
     except Exception as e:
-        print(f"❌ Google Imagen 3 生图 API 调用失败: {e}")
-        return False
+        print(f"⚠️ Zenmux 生图 API 调用失败: {e}")
+        print("🛠️ 已自动启动 [应急绘制模式]：使用 Pillow 原生生成极简纯色高级留白底图。")
+        
+        img = Image.new('RGB', (1024, 1448), color=(242, 242, 242))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse([800, 1000, 1500, 1700], fill=(230, 230, 230))
+        draw.ellipse([-200, -200, 400, 400], fill=(235, 235, 235))
+        
+        img.save(BASE_IMAGE_PATH)
+        print(f"🖼️ 应急极简底图已生成至: {BASE_IMAGE_PATH}")
+        return True
 
 
 def is_mostly_english(text):
